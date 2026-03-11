@@ -94,7 +94,7 @@ def _parse_avoid_peers(values: list[str]) -> tuple[list[str], set[tuple[str, int
 # ---------------------------------------------------------------------
 
 ALLJUNK_CHANNEL   = "a" * 64
-PROTOCOL_VERSION  = 9
+PROTOCOL_VERSION  = 10
 MARKOV_LAMBDA     = 0.01
 TRUST_FLOOR       = 0.1
 MAX_HOPS          = 12
@@ -272,18 +272,49 @@ class Identity:
         self.x25519_pub_hex = x_pub.hex()
 
     @staticmethod
-    def _canonical(node_id, nonce, ts, payload_bytes):
-        nid    = bytes.fromhex(node_id)
-        nonc   = bytes.fromhex(nonce.ljust(32, "0")[:32])
-        header = struct.pack(">B32s16sd", PROTOCOL_VERSION, nid, nonc, ts)
-        return hashlib.sha256(header + payload_bytes).digest()
+    def _canonical(node_id: str, nonce: str, ts: float,
+                   msg_type: str, channel_id: str, ttl0: int,
+                   payload_bytes: bytes) -> bytes:
+        """Canonical bytes for message signing.
 
-    def sign_msg(self, nonce, ts, payload_bytes):
+        End-to-end authenticates:
+          - type
+          - channel
+          - ttl0 (cap)
+
+        `ttl` is intentionally not signed; receivers enforce `ttl <= ttl0`.
+        """
+        nid = bytes.fromhex(node_id)
+        nonc = bytes.fromhex((nonce or "").ljust(32, "0")[:32])
+
+        mt = (msg_type or "").encode()
+        ch = (channel_id or "").encode()
+        if len(mt) > 255 or len(ch) > 255:
+            raise ValueError("msg_type/channel too long")
+
+        ttl_i = int(ttl0)
+        if ttl_i < 0:
+            ttl_i = 0
+        if ttl_i > 65535:
+            ttl_i = 65535
+
+        header = struct.pack(">B32s16sdBH", PROTOCOL_VERSION, nid, nonc, float(ts),
+                             len(mt), ttl_i)
+        return hashlib.sha256(
+            header + mt + struct.pack(">B", len(ch)) + ch + payload_bytes
+        ).digest()
+
+    def sign_msg(self, nonce: str, ts: float,
+                 msg_type: str, channel_id: str, ttl0: int,
+                 payload_bytes: bytes) -> str:
         return self._ed_priv.sign(
-            self._canonical(self.node_id, nonce, ts, payload_bytes)).hex()
+            self._canonical(self.node_id, nonce, ts, msg_type, channel_id, ttl0, payload_bytes)
+        ).hex()
 
     @staticmethod
-    def verify_msg(pub_hex, node_id, nonce, ts, payload_bytes, sig_hex):
+    def verify_msg(pub_hex: str, node_id: str, nonce: str, ts: float,
+                   msg_type: str, channel_id: str, ttl0: int,
+                   payload_bytes: bytes, sig_hex: str) -> bool:
         try:
             pub_bytes = bytes.fromhex(pub_hex)
         except ValueError:
@@ -293,7 +324,7 @@ class Identity:
         try:
             pub = Ed25519PublicKey.from_public_bytes(pub_bytes)
             pub.verify(bytes.fromhex(sig_hex),
-                       Identity._canonical(node_id, nonce, ts, payload_bytes))
+                       Identity._canonical(node_id, nonce, ts, msg_type, channel_id, ttl0, payload_bytes))
             return True
         except (InvalidSignature, ValueError):
             return False
@@ -664,6 +695,12 @@ class Channel:
 
     def verify_member(self, identity: Identity, node_id: str,
                       pub_hex: str, proof: str) -> bool:
+        try:
+            pub_bytes = bytes.fromhex(pub_hex)
+        except ValueError:
+            return False
+        if hashlib.sha256(pub_bytes).hexdigest() != (node_id or ""):
+            return False
         ok = identity.verify(pub_hex, self.channel_id.encode(), proof)
         if ok:
             self.members.add(node_id)
@@ -895,11 +932,13 @@ def make_message(identity: Identity, msg_type: str, payload: dict,
     nonce = os.urandom(8).hex()
     ts    = time.time()
     pb    = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-    sig   = identity.sign_msg(nonce, ts, pb)
+    ttl0  = int(ttl)
+    sig   = identity.sign_msg(nonce, ts, msg_type, channel_id, ttl0, pb)
     return json.dumps({
         "v": PROTOCOL_VERSION, "type": msg_type, "channel": channel_id,
         "from": identity.node_id, "pub": identity.pub_hex,
-        "ts": ts, "nonce": nonce, "ttl": ttl, "payload": payload, "sig": sig,
+        "ts": ts, "nonce": nonce, "ttl": ttl, "ttl0": ttl0,
+        "payload": payload, "sig": sig,
     }, separators=(",", ":")).encode()
 
 
@@ -910,13 +949,27 @@ def parse_message(data: bytes, replay_cache: ReplayCache) -> Optional[dict]:
         return None
     if not all(k in msg for k in
                ("v", "type", "channel", "from", "pub", "ts",
-                "nonce", "ttl", "payload", "sig")):
+                "nonce", "ttl", "ttl0", "payload", "sig")):
+        return None
+
+    if msg.get("v") != PROTOCOL_VERSION:
+        return None
+
+    try:
+        ttl = int(msg.get("ttl", 0))
+        ttl0 = int(msg.get("ttl0", 0))
+    except (TypeError, ValueError):
+        return None
+    if ttl < 0 or ttl0 < 0 or ttl > ttl0:
         return None
     if not replay_cache.check(msg["nonce"], float(msg["ts"])):
         return None
     pb = json.dumps(msg["payload"], separators=(",", ":"), sort_keys=True).encode()
-    if not Identity.verify_msg(msg["pub"], msg["from"], msg["nonce"],
-                               float(msg["ts"]), pb, msg["sig"]):
+    if not Identity.verify_msg(
+        msg["pub"], msg["from"], msg["nonce"], float(msg["ts"]),
+        msg.get("type", ""), msg.get("channel", ""), ttl0,
+        pb, msg["sig"],
+    ):
         return None
     return msg
 
@@ -933,9 +986,45 @@ class ContentStore:
     async def init_tables(self):
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS content (
-                key TEXT PRIMARY KEY, channel_id TEXT,
-                data BLOB, stored_at REAL, size INTEGER, from_node TEXT
+                key TEXT,
+                channel_id TEXT,
+                data BLOB,
+                stored_at REAL,
+                size INTEGER,
+                from_node TEXT,
+                PRIMARY KEY (key, channel_id)
             )""")
+        await self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_key ON content(key)"
+        )
+
+        try:
+            async with self.db.execute("PRAGMA table_info(content)") as cur:
+                cols = await cur.fetchall()
+            key_pk = any((r[1] == "key" and int(r[5] or 0) == 1) for r in cols)
+            chan_pk = any((r[1] == "channel_id" and int(r[5] or 0) >= 1) for r in cols)
+            if key_pk and not chan_pk:
+                await self.db.execute("""
+                    CREATE TABLE IF NOT EXISTS content_v2 (
+                        key TEXT,
+                        channel_id TEXT,
+                        data BLOB,
+                        stored_at REAL,
+                        size INTEGER,
+                        from_node TEXT,
+                        PRIMARY KEY (key, channel_id)
+                    )""")
+                await self.db.execute(
+                    "INSERT OR REPLACE INTO content_v2 SELECT key, channel_id, data, stored_at, size, from_node FROM content"
+                )
+                await self.db.execute("DROP TABLE content")
+                await self.db.execute("ALTER TABLE content_v2 RENAME TO content")
+                await self.db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_content_key ON content(key)"
+                )
+        except Exception as e:
+            log.debug("content schema migration skipped: %s", e)
+
         await self.db.commit()
 
     async def total_stored(self) -> int:
@@ -958,15 +1047,22 @@ class ContentStore:
         await self.db.commit()
         return key
 
-    async def get(self, key: str) -> Optional[bytes]:
+    async def get(self, key: str, channel_id: str = ALLJUNK_CHANNEL) -> Optional[bytes]:
         async with self.db.execute(
-            "SELECT data FROM content WHERE key=?", (key,)) as cur:
+            "SELECT data FROM content WHERE key=? AND channel_id=?",
+            (key, channel_id)) as cur:
             row = await cur.fetchone()
         return row[0] if row else None
 
-    async def has(self, key: str) -> bool:
+    async def has(self, key: str, channel_id: str = ALLJUNK_CHANNEL) -> bool:
         async with self.db.execute(
-            "SELECT 1 FROM content WHERE key=?", (key,)) as cur:
+            "SELECT 1 FROM content WHERE key=? AND channel_id=?",
+            (key, channel_id)) as cur:
+            return (await cur.fetchone()) is not None
+
+    async def has_any_channel(self, key: str) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM content WHERE key=? LIMIT 1", (key,)) as cur:
             return (await cur.fetchone()) is not None
 
     async def list_channel(self, channel_id: str) -> list:
@@ -1085,7 +1181,17 @@ class Node:
         msg = parse_message(data, self.replay_cache)
         if msg is None:
             return
-        await self.trust.record_download(msg["from"], len(data))
+
+        peer_id = None
+        if self.routing:
+            for nid, p in self.routing.peers.items():
+                if p.host == addr[0] and p.port == addr[1]:
+                    peer_id = nid
+                    break
+        if peer_id and self.trust:
+            await self.trust.record_download(peer_id, len(data))
+        else:
+            await self.trust.record_download(msg["from"], len(data))
         await self.handle_message(msg, addr)
 
     async def handle_message(self, msg: dict, addr: tuple):
@@ -1158,16 +1264,35 @@ class Node:
             log.info("stored key=%s size=%d", key[:12], len(data))
 
     async def _on_find(self, msg: dict, addr: tuple):
+        if msg["from"] not in self._registered:
+            return
+        ch = self.channels.get(msg["channel"])
+        if not ch:
+            return
+        ts = await self.trust.score(msg["from"])
+        if not ch.admits(msg["from"], ts):
+            return
+
         key = msg["payload"].get("key", "")
-        if await self.content.has(key):
-            if msg["from"] in self._registered:
-                data = await self.content.get(key)
-                self._send("found", {"key": key, "data": data.hex()},
-                           addr, msg["channel"])
+        if await self.content.has(key, msg["channel"]):
+            data = await self.content.get(key, msg["channel"])
+            if data is None:
+                return
+            self._send("found", {"key": key, "data": data.hex()},
+                       addr, msg["channel"])
         elif msg["ttl"] > 0:
             await self._forward(msg)
 
     async def _on_found(self, msg: dict, addr: tuple):
+        if msg["from"] not in self._registered:
+            return
+        ch = self.channels.get(msg["channel"])
+        if not ch:
+            return
+        ts = await self.trust.score(msg["from"])
+        if not ch.admits(msg["from"], ts):
+            return
+
         key = msg["payload"].get("key", "")
         try:
             data = bytes.fromhex(msg["payload"].get("data", ""))
@@ -1245,9 +1370,34 @@ class Node:
                 return
             if not DiskGuard.item_size_ok(data):
                 return
-            ch  = self.channels.get(cmd_obj.get("channel", channel_id),
-                                    Channel.all_junk())
-            key = await self.content.put(data, ch.channel_id, "onion")
+            ch_id = cmd_obj.get("channel", channel_id)
+            ch = self.channels.get(ch_id)
+            if not ch:
+                return
+            if ch.channel_id != ALLJUNK_CHANNEL:
+                sender_id = cmd_obj.get("from", "")
+                sender_pub = cmd_obj.get("pub", "")
+                proof = cmd_obj.get("proof", "")
+                auth_nonce = cmd_obj.get("auth_nonce", "")
+                auth_sig = cmd_obj.get("auth_sig", "")
+                if not (sender_id and sender_pub and proof):
+                    return
+                if not ch.verify_member(self.identity, sender_id, sender_pub, proof):
+                    return
+                if not (auth_nonce and auth_sig):
+                    return
+                data_key = hashlib.sha256(data).hexdigest()
+                auth_bytes = f"{ch.channel_id}|store|{data_key}|{auth_nonce}".encode()
+                if not self.identity.verify(sender_pub, auth_bytes, auth_sig):
+                    return
+                ts = await self.trust.score(sender_id)
+                if not ch.admits(sender_id, ts):
+                    return
+                from_node = sender_id
+            else:
+                from_node = "onion"
+
+            key = await self.content.put(data, ch.channel_id, from_node)
             if key:
                 log.info("onion store key=%s size=%d OK", key[:12], len(data))
 
@@ -1261,11 +1411,35 @@ class Node:
             if not (reply_token and reply_host and reply_port and reply_key_h):
                 log.debug("onion find: missing reply fields")
                 return
-            if not await self.content.has(key):
+            ch = self.channels.get(channel_id)
+            if not ch:
+                return
+            if ch.channel_id != ALLJUNK_CHANNEL:
+                sender_id = cmd_obj.get("from", "")
+                sender_pub = cmd_obj.get("pub", "")
+                proof = cmd_obj.get("proof", "")
+                auth_nonce = cmd_obj.get("auth_nonce", "")
+                auth_sig = cmd_obj.get("auth_sig", "")
+                if not (sender_id and sender_pub and proof):
+                    return
+                if not ch.verify_member(self.identity, sender_id, sender_pub, proof):
+                    return
+                if not (auth_nonce and auth_sig):
+                    return
+                auth_bytes = f"{ch.channel_id}|find|{key}|{auth_nonce}".encode()
+                if not self.identity.verify(sender_pub, auth_bytes, auth_sig):
+                    return
+                ts = await self.trust.score(sender_id)
+                if not ch.admits(sender_id, ts):
+                    return
+
+            if not await self.content.has(key, ch.channel_id):
                 log.info("onion find key=%s -- not found locally", key[:12])
                 return
 
-            data = await self.content.get(key)
+            data = await self.content.get(key, ch.channel_id)
+            if data is None:
+                return
             if len(data) > REPLY_CONTENT_MAX:
                 log.warning("onion find key=%s -- content too large (%d > %d)",
                             key[:12], len(data), REPLY_CONTENT_MAX)
@@ -1340,18 +1514,22 @@ class Node:
                       token[:8], route.next_host, route.next_port)
 
     async def _forward(self, msg: dict):
-        msg        = dict(msg)
-        msg["ttl"] -= 1
-        ch         = self.channels.get(msg["channel"], Channel.all_junk())
-        nh         = self.routing.probabilistic_next_hop(ch)
+        msg = dict(msg)
+        msg["ttl"] = max(0, int(msg.get("ttl", 0)) - 1)
+        ch = self.channels.get(msg.get("channel", ""))
+        if not ch:
+            return
+        nh = self.routing.probabilistic_next_hop(ch)
         if nh:
-            self.protocol.send(
-                json.dumps(msg, separators=(",", ":")).encode(), nh.addr)
+            data = json.dumps(msg, separators=(",", ":")).encode()
+            self.protocol.send(data, nh.addr)
+            if self.trust:
+                asyncio.ensure_future(self.trust.record_upload(nh.node_id, len(data)))
 
     async def find_content(self, key: str,
                            channel_id: str = ALLJUNK_CHANNEL) -> Optional[bytes]:
-        if await self.content.has(key):
-            return await self.content.get(key)
+        if await self.content.has(key, channel_id):
+            return await self.content.get(key, channel_id)
         ch = self.channels.get(channel_id, Channel.all_junk())
         nh = self.routing.ssep_next_hop(key, ch)
         if nh:
@@ -1377,9 +1555,26 @@ class Node:
             log.warning("onion publish fallback: only %d onion peers", len(hops))
             return await self.publish(data, channel_id)
 
-        payload = json.dumps({
-            "cmd": "store", "data": data.hex(), "channel": channel_id,
-        }, separators=(",", ":")).encode()
+        payload_obj = {
+            "cmd": "store",
+            "data": data.hex(),
+            "channel": channel_id,
+        }
+        if channel_id != ALLJUNK_CHANNEL:
+            if channel_id not in self.channels:
+                log.error("onion publish: unknown channel")
+                return None
+            auth_nonce = os.urandom(8).hex()
+            data_key = hashlib.sha256(data).hexdigest()
+            auth_bytes = f"{channel_id}|store|{data_key}|{auth_nonce}".encode()
+            payload_obj.update({
+                "from": self.identity.node_id,
+                "pub": self.identity.pub_hex,
+                "proof": self.channels.get(channel_id, Channel.all_junk()).membership_proof(self.identity),
+                "auth_nonce": auth_nonce,
+                "auth_sig": self.identity.sign(auth_bytes),
+            })
+        payload = json.dumps(payload_obj, separators=(",", ":")).encode()
         if len(payload) > EXIT_PLAIN - PLAIN_HEADER:
             log.error("onion publish: payload too large")
             return None
@@ -1405,8 +1600,8 @@ class Node:
         Forward:  self -> fh1 -> fh2 -> fh3 (exit)
         Reply:    exit -> rh1 -> rh2 -> rh3 -> self
         """
-        if await self.content.has(key):
-            return await self.content.get(key)
+        if await self.content.has(key, channel_id):
+            return await self.content.get(key, channel_id)
 
         all_hops = self.routing.onion_capable_peers(CIRCUIT_HOPS * 2)
         if len(all_hops) < CIRCUIT_HOPS * 2:
@@ -1448,14 +1643,28 @@ class Node:
 
         await asyncio.sleep(0.3)
 
-        find_payload = json.dumps({
+        find_obj = {
             "cmd":         "find",
             "key":         key,
             "reply_token": tokens[0],
             "reply_host":  reply_hops[0].host,
             "reply_port":  reply_hops[0].port,
             "reply_key":   reply_key.hex(),
-        }, separators=(",", ":")).encode()
+        }
+        if channel_id != ALLJUNK_CHANNEL:
+            if channel_id not in self.channels:
+                log.error("find_onion: unknown channel")
+                return None
+            auth_nonce = os.urandom(8).hex()
+            auth_bytes = f"{channel_id}|find|{key}|{auth_nonce}".encode()
+            find_obj.update({
+                "from": self.identity.node_id,
+                "pub": self.identity.pub_hex,
+                "proof": self.channels.get(channel_id, Channel.all_junk()).membership_proof(self.identity),
+                "auth_nonce": auth_nonce,
+                "auth_sig": self.identity.sign(auth_bytes),
+            })
+        find_payload = json.dumps(find_obj, separators=(",", ":")).encode()
 
         if len(find_payload) > EXIT_PLAIN - PLAIN_HEADER:
             log.error("find_onion: payload too large (%d)", len(find_payload))
@@ -1551,7 +1760,14 @@ class Node:
               channel_id: str = ALLJUNK_CHANNEL):
         data = make_message(self.identity, msg_type, payload, channel_id)
         self.protocol.send(data, addr)
-        asyncio.ensure_future(self.trust.record_upload(addr[0], len(data)))
+        peer_id = None
+        if self.routing:
+            for nid, p in self.routing.peers.items():
+                if p.host == addr[0] and p.port == addr[1]:
+                    peer_id = nid
+                    break
+        if peer_id and self.trust:
+            asyncio.ensure_future(self.trust.record_upload(peer_id, len(data)))
 
     def _register_peer(self, msg: dict, addr: tuple, x25519_pub: str = ""):
         nid = msg["from"]
