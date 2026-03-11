@@ -61,6 +61,10 @@ logging.basicConfig(
 log = logging.getLogger("overnet")
 
 
+def _canonical_json_bytes(obj: dict) -> bytes:
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode()
+
+
 def _parse_avoid_peers(values: list[str]) -> tuple[list[str], set[tuple[str, int]]]:
     """Parse avoid-peer selectors.
 
@@ -111,6 +115,14 @@ SSEP_BAND_FLOOR = 0.02
 
 # Reply token limits (v8)
 MAX_TOKENS_PER_DEST = 100
+
+# Restricted-channel authorization (v10)
+CHANNEL_DESCRIPTOR_CONTEXT = b"overnet-channel-descriptor-v1"
+CHANNEL_MEMBER_CONTEXT     = b"overnet-channel-member-v1"
+
+# Plain find reverse-route cache (v10)
+FIND_ROUTE_TTL  = 60
+MAX_FIND_ROUTES = 4096
 
 # Hot table / routing (v3)
 HOT_TABLE_SIZE    = 64
@@ -277,12 +289,13 @@ class Identity:
                    payload_bytes: bytes) -> bytes:
         """Canonical bytes for message signing.
 
-        End-to-end authenticates:
+        End-to-end authenticates routing/policy-critical outer fields:
           - type
           - channel
           - ttl0 (cap)
 
-        `ttl` is intentionally not signed; receivers enforce `ttl <= ttl0`.
+        `ttl` (remaining hops) is intentionally NOT signed so relays can
+        decrement it without re-signing. Receivers enforce `ttl <= ttl0`.
         """
         nid = bytes.fromhex(node_id)
         nonc = bytes.fromhex((nonce or "").ljust(32, "0")[:32])
@@ -332,13 +345,17 @@ class Identity:
     def sign(self, data: bytes) -> str:
         return self._ed_priv.sign(data).hex()
 
-    def verify(self, pub_hex: str, data: bytes, sig_hex: str) -> bool:
+    @staticmethod
+    def verify_signature(pub_hex: str, data: bytes, sig_hex: str) -> bool:
         try:
             pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
             pub.verify(bytes.fromhex(sig_hex), data)
             return True
         except (InvalidSignature, ValueError):
             return False
+
+    def verify(self, pub_hex: str, data: bytes, sig_hex: str) -> bool:
+        return self.verify_signature(pub_hex, data, sig_hex)
 
     def x25519_exchange(self, their_pub_bytes: bytes) -> bytes:
         return self._x_priv.exchange(X25519PublicKey.from_public_bytes(their_pub_bytes))
@@ -552,6 +569,48 @@ class ReplyRouter:
             self._dest_counts[dest] = n
 
 
+@dataclass
+class FindRoute:
+    prev_addr: tuple
+    expires:   float = field(default_factory=lambda: time.time() + FIND_ROUTE_TTL)
+
+    @property
+    def expired(self) -> bool:
+        return time.time() > self.expires
+
+
+class FindRouteCache:
+    MAX_ROUTES = MAX_FIND_ROUTES
+
+    def __init__(self):
+        self._routes: collections.OrderedDict[str, FindRoute] = \
+            collections.OrderedDict()
+
+    @staticmethod
+    def _route_key(channel_id: str, key: str) -> str:
+        return f"{channel_id}:{key}"
+
+    def register(self, channel_id: str, key: str, prev_addr: tuple):
+        if not (channel_id and key):
+            return
+        route_key = self._route_key(channel_id, key)
+        self._routes[route_key] = FindRoute(prev_addr)
+        self._routes.move_to_end(route_key)
+        while len(self._routes) > self.MAX_ROUTES:
+            self._routes.popitem(last=False)
+
+    def pop(self, channel_id: str, key: str) -> Optional[tuple]:
+        route = self._routes.pop(self._route_key(channel_id, key), None)
+        if route is None or route.expired:
+            return None
+        return route.prev_addr
+
+    def evict_expired(self):
+        expired = [k for k, route in self._routes.items() if route.expired]
+        for route_key in expired:
+            self._routes.pop(route_key, None)
+
+
 # ---------------------------------------------------------------------
 # TRUST LEDGER
 # ---------------------------------------------------------------------
@@ -680,31 +739,112 @@ class DiskGuard:
 
 @dataclass
 class Channel:
-    channel_id:  str
-    name:        str
-    trust_min:   float = 0.0
-    description: str   = ""
-    members:     set   = field(default_factory=set)
+    channel_id:    str
+    name:          str
+    trust_min:     float = 0.0
+    description:   str   = ""
+    members:       set   = field(default_factory=set)
+    owner_id:      str   = ""
+    owner_pub:     str   = ""
+    owner_sig:     str   = ""
+    member_proofs: dict[str, str] = field(default_factory=dict, repr=False)
 
     @classmethod
     def all_junk(cls) -> "Channel":
         return cls(ALLJUNK_CHANNEL, "all-junk", 0.0, "Base channel. No filters.")
 
-    def membership_proof(self, identity: Identity) -> str:
-        return identity.sign(self.channel_id.encode())
+    def _descriptor_payload(self) -> dict:
+        return {
+            "channel_id": self.channel_id,
+            "name": self.name,
+            "trust_min": f"{float(self.trust_min):.6f}",
+            "description": self.description,
+            "owner_id": self.owner_id,
+        }
 
-    def verify_member(self, identity: Identity, node_id: str,
-                      pub_hex: str, proof: str) -> bool:
+    def descriptor_bytes(self) -> bytes:
+        return CHANNEL_DESCRIPTOR_CONTEXT + b"|" + _canonical_json_bytes(
+            self._descriptor_payload())
+
+    def descriptor(self) -> dict:
+        if self.channel_id == ALLJUNK_CHANNEL:
+            return self._descriptor_payload()
+        return {
+            **self._descriptor_payload(),
+            "owner_pub": self.owner_pub,
+            "owner_sig": self.owner_sig,
+        }
+
+    @classmethod
+    def from_descriptor(cls, descriptor: dict) -> Optional["Channel"]:
+        if not isinstance(descriptor, dict):
+            return None
+        try:
+            channel_id  = str(descriptor["channel_id"])
+            name        = str(descriptor["name"])
+            trust_min   = float(descriptor.get("trust_min", 0.0))
+            description = str(descriptor.get("description", ""))
+            owner_id    = str(descriptor["owner_id"])
+            owner_pub   = str(descriptor["owner_pub"])
+            owner_sig   = str(descriptor["owner_sig"])
+            owner_bytes = bytes.fromhex(owner_pub)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if hashlib.sha256(owner_bytes).hexdigest() != owner_id:
+            return None
+        if hashlib.sha256(f"{name}{owner_id}".encode()).hexdigest() != channel_id:
+            return None
+        ch = cls(channel_id, name, trust_min, description, {owner_id},
+                 owner_id, owner_pub, owner_sig)
+        if not Identity.verify_signature(owner_pub, ch.descriptor_bytes(), owner_sig):
+            return None
+        return ch
+
+    def membership_bytes(self, member_id: str) -> bytes:
+        payload = {
+            "channel_id": self.channel_id,
+            "member_id": member_id,
+            "owner_id": self.owner_id,
+        }
+        return CHANNEL_MEMBER_CONTEXT + b"|" + _canonical_json_bytes(payload)
+
+    def issue_membership(self, identity: Identity, member_id: str) -> str:
+        if self.channel_id == ALLJUNK_CHANNEL:
+            return ""
+        if identity.node_id != self.owner_id or identity.pub_hex != self.owner_pub:
+            return ""
+        return identity.sign(self.membership_bytes(member_id))
+
+    def membership_proof(self, identity: Identity) -> str:
+        if self.channel_id == ALLJUNK_CHANNEL:
+            return ""
+        proof = self.member_proofs.get(identity.node_id, "")
+        if proof and self.verify_member(identity.node_id, identity.pub_hex, proof):
+            return proof
+        if identity.node_id == self.owner_id and identity.pub_hex == self.owner_pub:
+            proof = self.issue_membership(identity, identity.node_id)
+            if proof:
+                self.member_proofs[identity.node_id] = proof
+                self.members.add(identity.node_id)
+            return proof
+        return ""
+
+    def verify_member_id(self, node_id: str, proof: str) -> bool:
+        if self.channel_id == ALLJUNK_CHANNEL:
+            return True
+        if not (self.owner_id and self.owner_pub and node_id and proof):
+            return False
+        return Identity.verify_signature(
+            self.owner_pub, self.membership_bytes(node_id), proof)
+
+    def verify_member(self, node_id: str, pub_hex: str, proof: str) -> bool:
         try:
             pub_bytes = bytes.fromhex(pub_hex)
         except ValueError:
             return False
         if hashlib.sha256(pub_bytes).hexdigest() != (node_id or ""):
             return False
-        ok = identity.verify(pub_hex, self.channel_id.encode(), proof)
-        if ok:
-            self.members.add(node_id)
-        return ok
+        return self.verify_member_id(node_id, proof)
 
     def admits(self, node_id: str, trust_score: float) -> bool:
         if self.channel_id == ALLJUNK_CHANNEL:
@@ -952,9 +1092,11 @@ def parse_message(data: bytes, replay_cache: ReplayCache) -> Optional[dict]:
                 "nonce", "ttl", "ttl0", "payload", "sig")):
         return None
 
+    # Explicit version gating: signature canonicalization is versioned.
     if msg.get("v") != PROTOCOL_VERSION:
         return None
 
+    # ttl must be in [0, ttl0] to prevent hop amplification.
     try:
         ttl = int(msg.get("ttl", 0))
         ttl0 = int(msg.get("ttl0", 0))
@@ -984,6 +1126,7 @@ class ContentStore:
         self.dbfile = dbfile
 
     async def init_tables(self):
+        # v2 schema: composite primary key (key, channel_id)
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS content (
                 key TEXT,
@@ -998,9 +1141,11 @@ class ContentStore:
             "CREATE INDEX IF NOT EXISTS idx_content_key ON content(key)"
         )
 
+        # Best-effort migration from older schema where key was PRIMARY KEY.
         try:
             async with self.db.execute("PRAGMA table_info(content)") as cur:
                 cols = await cur.fetchall()
+            # Old schema had key as pk=1 and no composite pk.
             key_pk = any((r[1] == "key" and int(r[5] or 0) == 1) for r in cols)
             chan_pk = any((r[1] == "channel_id" and int(r[5] or 0) >= 1) for r in cols)
             if key_pk and not chan_pk:
@@ -1137,6 +1282,7 @@ class Node:
         self.rate_limiter = TokenBucket()
         self.replay_cache = ReplayCache()
         self.reply_router = ReplyRouter()
+        self.find_routes  = FindRouteCache()
         self._avoid_node_prefixes = list(avoid_node_prefixes or [])
         self._avoid_hostports = set(avoid_hostports or set())
         self._avoid_extra_latency_ms = float(avoid_extra_latency_ms or 0.0)
@@ -1182,6 +1328,7 @@ class Node:
         if msg is None:
             return
 
+        # Trust ledger is keyed by node_id, and should track *neighbor* traffic.
         peer_id = None
         if self.routing:
             for nid, p in self.routing.peers.items():
@@ -1212,6 +1359,42 @@ class Node:
         h = handlers.get(msg["type"])
         if h:
             await h(msg, addr)
+
+    def _lookup_peer_id(self, addr: tuple) -> Optional[str]:
+        if not self.routing:
+            return None
+        for nid, peer in self.routing.peers.items():
+            if peer.host == addr[0] and peer.port == addr[1]:
+                return nid
+        return None
+
+    def _send_raw(self, msg: dict, addr: tuple):
+        data = json.dumps(msg, separators=(",", ":")).encode()
+        self.protocol.send(data, addr)
+        peer_id = self._lookup_peer_id(addr)
+        if peer_id and self.trust:
+            asyncio.ensure_future(self.trust.record_upload(peer_id, len(data)))
+
+    def _merge_channel(self, descriptor: dict) -> Optional[Channel]:
+        ch = Channel.from_descriptor(descriptor)
+        if ch is None:
+            return None
+        existing = self.channels.get(ch.channel_id)
+        if existing is None:
+            self.channels[ch.channel_id] = ch
+            return ch
+        if existing.channel_id == ALLJUNK_CHANNEL:
+            return existing
+        if existing.owner_id and existing.owner_id != ch.owner_id:
+            return None
+        existing.name = ch.name
+        existing.trust_min = ch.trust_min
+        existing.description = ch.description
+        existing.owner_id = ch.owner_id
+        existing.owner_pub = ch.owner_pub
+        existing.owner_sig = ch.owner_sig
+        existing.members.add(ch.owner_id)
+        return existing
 
     async def _on_hello(self, msg: dict, addr: tuple):
         real_addr = (addr[0], msg["payload"].get("port", addr[1]))
@@ -1266,26 +1449,35 @@ class Node:
     async def _on_find(self, msg: dict, addr: tuple):
         if msg["from"] not in self._registered:
             return
-        ch = self.channels.get(msg["channel"])
-        if not ch:
-            return
-        ts = await self.trust.score(msg["from"])
-        if not ch.admits(msg["from"], ts):
-            return
-
         key = msg["payload"].get("key", "")
-        if await self.content.has(key, msg["channel"]):
-            data = await self.content.get(key, msg["channel"])
-            if data is None:
+        ch = self.channels.get(msg["channel"])
+        if ch:
+            ts = await self.trust.score(msg["from"])
+            if not ch.admits(msg["from"], ts):
                 return
-            self._send("found", {"key": key, "data": data.hex()},
-                       addr, msg["channel"])
-        elif msg["ttl"] > 0:
+            if await self.content.has(key, msg["channel"]):
+                data = await self.content.get(key, msg["channel"])
+                if data is None:
+                    return
+                self._send("found", {"key": key, "data": data.hex()},
+                           addr, msg["channel"])
+            elif msg["ttl"] > 0 and key:
+                self.find_routes.register(msg["channel"], key, addr)
+                await self._forward(msg)
+            return
+        if msg["ttl"] > 0 and key:
+            self.find_routes.register(msg["channel"], key, addr)
             await self._forward(msg)
 
     async def _on_found(self, msg: dict, addr: tuple):
         if msg["from"] not in self._registered:
             return
+        key = msg["payload"].get("key", "")
+        prev_addr = self.find_routes.pop(msg["channel"], key)
+        if prev_addr:
+            self._send_raw(msg, prev_addr)
+            return
+
         ch = self.channels.get(msg["channel"])
         if not ch:
             return
@@ -1293,7 +1485,6 @@ class Node:
         if not ch.admits(msg["from"], ts):
             return
 
-        key = msg["payload"].get("key", "")
         try:
             data = bytes.fromhex(msg["payload"].get("data", ""))
         except ValueError:
@@ -1311,12 +1502,33 @@ class Node:
             await self._forward(msg)
 
     async def _on_channel_join(self, msg: dict, addr: tuple):
-        ch = self.channels.get(msg["payload"].get("channel_id", ""))
-        if not ch:
+        payload = msg.get("payload", {})
+        ch = None
+        descriptor = payload.get("channel")
+        if isinstance(descriptor, dict):
+            ch = self._merge_channel(descriptor)
+            if ch and ch.channel_id != msg["channel"]:
+                return
+        if ch is None:
+            ch = self.channels.get(payload.get("channel_id", "") or msg["channel"])
+        if not ch or ch.channel_id == ALLJUNK_CHANNEL:
             return
-        ok = ch.verify_member(self.identity, msg["from"], msg["pub"],
-                               msg["payload"].get("proof", ""))
-        log.info("channel %s: %s %s", ch.name, msg["from"][:8],
+
+        proof = payload.get("proof", "")
+        member_id = payload.get("member_id", msg["from"])
+        ok = False
+        if member_id == msg["from"]:
+            ok = ch.verify_member(msg["from"], msg["pub"], proof)
+            if ok:
+                ch.members.add(member_id)
+        elif msg["from"] == ch.owner_id and msg["pub"] == ch.owner_pub:
+            ok = ch.verify_member_id(member_id, proof)
+            if ok:
+                ch.members.add(member_id)
+                if member_id == self.identity.node_id:
+                    ch.member_proofs[self.identity.node_id] = proof
+
+        log.info("channel %s: %s %s", ch.name, member_id[:8],
                  "admitted" if ok else "rejected")
 
     async def _on_onion(self, msg: dict, addr: tuple):
@@ -1370,10 +1582,13 @@ class Node:
                 return
             if not DiskGuard.item_size_ok(data):
                 return
+
             ch_id = cmd_obj.get("channel", channel_id)
             ch = self.channels.get(ch_id)
             if not ch:
                 return
+
+            # Enforce channel policy for onion store.
             if ch.channel_id != ALLJUNK_CHANNEL:
                 sender_id = cmd_obj.get("from", "")
                 sender_pub = cmd_obj.get("pub", "")
@@ -1382,7 +1597,7 @@ class Node:
                 auth_sig = cmd_obj.get("auth_sig", "")
                 if not (sender_id and sender_pub and proof):
                     return
-                if not ch.verify_member(self.identity, sender_id, sender_pub, proof):
+                if not ch.verify_member(sender_id, sender_pub, proof):
                     return
                 if not (auth_nonce and auth_sig):
                     return
@@ -1391,8 +1606,9 @@ class Node:
                 if not self.identity.verify(sender_pub, auth_bytes, auth_sig):
                     return
                 ts = await self.trust.score(sender_id)
-                if not ch.admits(sender_id, ts):
+                if ts < ch.trust_min:
                     return
+                ch.members.add(sender_id)
                 from_node = sender_id
             else:
                 from_node = "onion"
@@ -1414,6 +1630,8 @@ class Node:
             ch = self.channels.get(channel_id)
             if not ch:
                 return
+
+            # Enforce channel policy for onion find (non-public channels require proof).
             if ch.channel_id != ALLJUNK_CHANNEL:
                 sender_id = cmd_obj.get("from", "")
                 sender_pub = cmd_obj.get("pub", "")
@@ -1422,7 +1640,7 @@ class Node:
                 auth_sig = cmd_obj.get("auth_sig", "")
                 if not (sender_id and sender_pub and proof):
                     return
-                if not ch.verify_member(self.identity, sender_id, sender_pub, proof):
+                if not ch.verify_member(sender_id, sender_pub, proof):
                     return
                 if not (auth_nonce and auth_sig):
                     return
@@ -1430,8 +1648,9 @@ class Node:
                 if not self.identity.verify(sender_pub, auth_bytes, auth_sig):
                     return
                 ts = await self.trust.score(sender_id)
-                if not ch.admits(sender_id, ts):
+                if ts < ch.trust_min:
                     return
+                ch.members.add(sender_id)
 
             if not await self.content.has(key, ch.channel_id):
                 log.info("onion find key=%s -- not found locally", key[:12])
@@ -1516,15 +1735,10 @@ class Node:
     async def _forward(self, msg: dict):
         msg = dict(msg)
         msg["ttl"] = max(0, int(msg.get("ttl", 0)) - 1)
-        ch = self.channels.get(msg.get("channel", ""))
-        if not ch:
-            return
+        ch = self.channels.get(msg.get("channel", ""), Channel.all_junk())
         nh = self.routing.probabilistic_next_hop(ch)
         if nh:
-            data = json.dumps(msg, separators=(",", ":")).encode()
-            self.protocol.send(data, nh.addr)
-            if self.trust:
-                asyncio.ensure_future(self.trust.record_upload(nh.node_id, len(data)))
+            self._send_raw(msg, nh.addr)
 
     async def find_content(self, key: str,
                            channel_id: str = ALLJUNK_CHANNEL) -> Optional[bytes]:
@@ -1552,14 +1766,15 @@ class Node:
                             channel_id: str = ALLJUNK_CHANNEL) -> Optional[str]:
         hops = self.routing.onion_capable_peers(CIRCUIT_HOPS)
         if len(hops) < CIRCUIT_HOPS:
-            log.warning("onion publish fallback: only %d onion peers", len(hops))
-            return await self.publish(data, channel_id)
+            log.error("onion publish aborted: only %d onion peers", len(hops))
+            return None
 
         payload_obj = {
             "cmd": "store",
             "data": data.hex(),
             "channel": channel_id,
         }
+        # For non-public channels, include membership proof so exits can enforce policy.
         if channel_id != ALLJUNK_CHANNEL:
             if channel_id not in self.channels:
                 log.error("onion publish: unknown channel")
@@ -1567,10 +1782,14 @@ class Node:
             auth_nonce = os.urandom(8).hex()
             data_key = hashlib.sha256(data).hexdigest()
             auth_bytes = f"{channel_id}|store|{data_key}|{auth_nonce}".encode()
+            proof = self.channels.get(channel_id, Channel.all_junk()).membership_proof(self.identity)
+            if not proof:
+                log.error("onion publish: missing local membership proof")
+                return None
             payload_obj.update({
                 "from": self.identity.node_id,
                 "pub": self.identity.pub_hex,
-                "proof": self.channels.get(channel_id, Channel.all_junk()).membership_proof(self.identity),
+                "proof": proof,
                 "auth_nonce": auth_nonce,
                 "auth_sig": self.identity.sign(auth_bytes),
             })
@@ -1605,9 +1824,9 @@ class Node:
 
         all_hops = self.routing.onion_capable_peers(CIRCUIT_HOPS * 2)
         if len(all_hops) < CIRCUIT_HOPS * 2:
-            log.warning("find_onion fallback: %d peers (need %d)",
-                        len(all_hops), CIRCUIT_HOPS * 2)
-            return await self.find_content(key, channel_id)
+            log.error("find_onion aborted: %d peers (need %d)",
+                      len(all_hops), CIRCUIT_HOPS * 2)
+            return None
 
         fwd_hops   = all_hops[:CIRCUIT_HOPS]
         reply_hops = all_hops[CIRCUIT_HOPS:]
@@ -1657,10 +1876,14 @@ class Node:
                 return None
             auth_nonce = os.urandom(8).hex()
             auth_bytes = f"{channel_id}|find|{key}|{auth_nonce}".encode()
+            proof = self.channels.get(channel_id, Channel.all_junk()).membership_proof(self.identity)
+            if not proof:
+                log.error("find_onion: missing local membership proof")
+                return None
             find_obj.update({
                 "from": self.identity.node_id,
                 "pub": self.identity.pub_hex,
-                "proof": self.channels.get(channel_id, Channel.all_junk()).membership_proof(self.identity),
+                "proof": proof,
                 "auth_nonce": auth_nonce,
                 "auth_sig": self.identity.sign(auth_bytes),
             })
@@ -1701,15 +1924,36 @@ class Node:
                        description: str = "") -> Channel:
         cid = hashlib.sha256(
             f"{name}{self.identity.node_id}".encode()).hexdigest()
-        ch  = Channel(cid, name, trust_min, description, {self.identity.node_id})
+        ch = Channel(cid, name, trust_min, description, {self.identity.node_id},
+                     self.identity.node_id, self.identity.pub_hex)
+        ch.owner_sig = self.identity.sign(ch.descriptor_bytes())
+        owner_proof = ch.issue_membership(self.identity, self.identity.node_id)
+        if owner_proof:
+            ch.member_proofs[self.identity.node_id] = owner_proof
         self.channels[cid] = ch
         log.info("channel '%s' created trust_min=%.1f", name, trust_min)
         return ch
 
     def join_channel(self, channel: Channel, peer_addr: tuple):
+        if channel.channel_id == ALLJUNK_CHANNEL:
+            return
+        member_id = self.identity.node_id
         proof = channel.membership_proof(self.identity)
+        if self.identity.node_id == channel.owner_id:
+            peer_id = self._lookup_peer_id(peer_addr)
+            if peer_id and peer_id != self.identity.node_id:
+                member_id = peer_id
+                proof = channel.issue_membership(self.identity, peer_id)
+                if proof:
+                    channel.member_proofs[peer_id] = proof
+                    channel.members.add(peer_id)
+        if not proof:
+            log.error("channel_join: missing membership proof")
+            return
         self._send("channel_join",
-                   {"channel_id": channel.channel_id, "proof": proof},
+                   {"channel": channel.descriptor(),
+                    "member_id": member_id,
+                    "proof": proof},
                    peer_addr, channel.channel_id)
 
     async def _ping_loop(self):
@@ -1733,6 +1977,7 @@ class Node:
                 del self._ping_nonces[n]
             self.rate_limiter.evict_old()
             self.reply_router.evict_expired()
+            self.find_routes.evict_expired()
 
     async def _cover_loop(self):
         """RED-9: Poisson-rate cover traffic."""
@@ -1760,12 +2005,7 @@ class Node:
               channel_id: str = ALLJUNK_CHANNEL):
         data = make_message(self.identity, msg_type, payload, channel_id)
         self.protocol.send(data, addr)
-        peer_id = None
-        if self.routing:
-            for nid, p in self.routing.peers.items():
-                if p.host == addr[0] and p.port == addr[1]:
-                    peer_id = nid
-                    break
+        peer_id = self._lookup_peer_id(addr)
         if peer_id and self.trust:
             asyncio.ensure_future(self.trust.record_upload(peer_id, len(data)))
 
