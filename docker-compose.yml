@@ -1,0 +1,137 @@
+
+
+# ─────────────────────────────────────────────────────────────────
+# Overnet v9 — 7-node testnet
+#
+# Minimum for full anonymous fetch via reply circuits:
+#   3 forward hops + 3 reply hops + self = 7 distinct peers
+#
+# node-a  bootstrap  172.30.0.10  :9000
+# node-b             172.30.0.11  :9001
+# node-c             172.30.0.12  :9002
+# node-d             172.30.0.13  :9003
+# node-e             172.30.0.14  :9004
+# node-f             172.30.0.15  :9005
+# node-g             172.30.0.16  :9006
+# ─────────────────────────────────────────────────────────────────
+
+networks:
+  overnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+services:
+
+  node-a:
+    build: .
+    container_name: overnet-node-a
+    networks:
+      overnet:
+        ipv4_address: 172.30.0.10
+    ports:
+      - "9000:9000/udp"
+    volumes:
+      - node-a-data:/data
+    command: ["--port", "9000", "--host", "0.0.0.0", "--public-host", "172.30.0.10"]
+    restart: unless-stopped
+
+  node-b:
+    build: .
+    container_name: overnet-node-b
+    networks:
+      overnet:
+        ipv4_address: 172.30.0.11
+    ports:
+      - "9001:9001/udp"
+    volumes:
+      - node-b-data:/data
+    command: ["--port", "9001", "--host", "0.0.0.0", "--public-host", "172.30.0.11",
+              "--peer", "9000", "--peer-host", "172.30.0.10"]
+    depends_on: [node-a]
+    restart: unless-stopped
+
+  node-c:
+    build: .
+    container_name: overnet-node-c
+    networks:
+      overnet:
+        ipv4_address: 172.30.0.12
+    ports:
+      - "9002:9002/udp"
+    volumes:
+      - node-c-data:/data
+    command: ["--port", "9002", "--host", "0.0.0.0", "--public-host", "172.30.0.12",
+              "--peer", "9000", "--peer-host", "172.30.0.10"]
+    depends_on: [node-a]
+    restart: unless-stopped
+
+  node-d:
+    build: .
+    container_name: overnet-node-d
+    networks:
+      overnet:
+        ipv4_address: 172.30.0.13
+    ports:
+      - "9003:9003/udp"
+    volumes:
+      - node-d-data:/data
+    command: ["--port", "9003", "--host", "0.0.0.0", "--public-host", "172.30.0.13",
+              "--peer", "9000", "--peer-host", "172.30.0.10"]
+    depends_on: [node-a]
+    restart: unless-stopped
+
+  node-e:
+    build: .
+    container_name: overnet-node-e
+    networks:
+      overnet:
+        ipv4_address: 172.30.0.14
+    ports:
+      - "9004:9004/udp"
+    volumes:
+      - node-e-data:/data
+    command: ["--port", "9004", "--host", "0.0.0.0", "--public-host", "172.30.0.14",
+              "--peer", "9000", "--peer-host", "172.30.0.10"]
+    depends_on: [node-a]
+    restart: unless-stopped
+
+  node-f:
+    build: .
+    container_name: overnet-node-f
+    networks:
+      overnet:
+        ipv4_address: 172.30.0.15
+    ports:
+      - "9005:9005/udp"
+    volumes:
+      - node-f-data:/data
+    command: ["--port", "9005", "--host", "0.0.0.0", "--public-host", "172.30.0.15",
+              "--peer", "9000", "--peer-host", "172.30.0.10"]
+    depends_on: [node-a]
+    restart: unless-stopped
+
+  node-g:
+    build: .
+    container_name: overnet-node-g
+    networks:
+      overnet:
+        ipv4_address: 172.30.0.16
+    ports:
+      - "9006:9006/udp"
+    volumes:
+      - node-g-data:/data
+    command: ["--port", "9006", "--host", "0.0.0.0", "--public-host", "172.30.0.16",
+              "--peer", "9000", "--peer-host", "172.30.0.10"]
+    depends_on: [node-a]
+    restart: unless-stopped
+
+volumes:
+  node-a-data:
+  node-b-data:
+  node-c-data:
+  node-d-data:
+  node-e-data:
+  node-f-data:
+  node-g-data:

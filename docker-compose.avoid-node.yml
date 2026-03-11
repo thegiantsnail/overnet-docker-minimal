@@ -1,0 +1,14 @@
+# Compose override: routing experiment
+# Bias one node away from a specific peer by injecting artificial distance/noise
+# into Markov weighting.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.avoid-node.yml up -d --build
+#
+services:
+  node-b:
+    command: ["--port", "9001", "--host", "0.0.0.0", "--public-host", "172.30.0.11",
+              "--peer", "9000", "--peer-host", "172.30.0.10",
+              "--avoid-peer", "172.30.0.13:9003",
+              "--avoid-extra-latency-ms", "800",
+              "--avoid-latency-noise-ms", "250"]
