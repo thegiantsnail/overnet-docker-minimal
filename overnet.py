@@ -583,7 +583,7 @@ class FindRouteCache:
     MAX_ROUTES = MAX_FIND_ROUTES
 
     def __init__(self):
-        self._routes: collections.OrderedDict[str, FindRoute] = \
+        self._routes: collections.OrderedDict[str, list[FindRoute]] = \
             collections.OrderedDict()
 
     @staticmethod
@@ -594,20 +594,29 @@ class FindRouteCache:
         if not (channel_id and key):
             return
         route_key = self._route_key(channel_id, key)
-        self._routes[route_key] = FindRoute(prev_addr)
+        routes = [
+            route for route in self._routes.get(route_key, [])
+            if not route.expired and route.prev_addr != prev_addr
+        ]
+        routes.append(FindRoute(prev_addr))
+        self._routes[route_key] = routes
         self._routes.move_to_end(route_key)
         while len(self._routes) > self.MAX_ROUTES:
             self._routes.popitem(last=False)
 
-    def pop(self, channel_id: str, key: str) -> Optional[tuple]:
-        route = self._routes.pop(self._route_key(channel_id, key), None)
-        if route is None or route.expired:
-            return None
-        return route.prev_addr
+    def pop(self, channel_id: str, key: str) -> list[tuple]:
+        routes = self._routes.pop(self._route_key(channel_id, key), [])
+        return [route.prev_addr for route in routes if not route.expired]
 
     def evict_expired(self):
-        expired = [k for k, route in self._routes.items() if route.expired]
-        for route_key in expired:
+        expired_keys = []
+        for route_key, routes in self._routes.items():
+            active = [route for route in routes if not route.expired]
+            if active:
+                self._routes[route_key] = active
+            else:
+                expired_keys.append(route_key)
+        for route_key in expired_keys:
             self._routes.pop(route_key, None)
 
 
@@ -1296,11 +1305,21 @@ class Node:
                  self.identity.x25519_pub_hex[:16])
 
     async def start(self):
+        preloaded_channels = [
+            ch for cid, ch in self.channels.items() if cid != ALLJUNK_CHANNEL
+        ]
         self.db      = await aiosqlite.connect(self.dbfile)
         self.trust   = TrustLedger(self.db)
         self.content = ContentStore(self.db, self.dbfile)
         await self.trust.init_tables()
         await self.content.init_tables()
+        await self._init_channel_tables()
+        await self._load_persisted_channels()
+        for ch in preloaded_channels:
+            self.channels[ch.channel_id] = ch
+            await self._persist_channel(ch)
+            for node_id, proof in ch.member_proofs.items():
+                await self._persist_member_proof(ch.channel_id, node_id, proof)
         self.routing = RoutingTable(
             self.trust,
             self.identity.node_id,
@@ -1375,6 +1394,95 @@ class Node:
         if peer_id and self.trust:
             asyncio.ensure_future(self.trust.record_upload(peer_id, len(data)))
 
+    async def _init_channel_tables(self):
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id  TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                trust_min   REAL NOT NULL,
+                description TEXT NOT NULL,
+                owner_id    TEXT NOT NULL,
+                owner_pub   TEXT NOT NULL,
+                owner_sig   TEXT NOT NULL
+            )""")
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS channel_members (
+                channel_id TEXT NOT NULL,
+                node_id    TEXT NOT NULL,
+                proof      TEXT NOT NULL,
+                PRIMARY KEY (channel_id, node_id)
+            )""")
+        await self.db.commit()
+
+    async def _load_persisted_channels(self):
+        async with self.db.execute(
+            "SELECT channel_id, name, trust_min, description, owner_id, owner_pub, owner_sig FROM channels"
+        ) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            descriptor = {
+                "channel_id": row[0],
+                "name": row[1],
+                "trust_min": row[2],
+                "description": row[3],
+                "owner_id": row[4],
+                "owner_pub": row[5],
+                "owner_sig": row[6],
+            }
+            ch = Channel.from_descriptor(descriptor)
+            if ch is None:
+                continue
+            existing = self.channels.get(ch.channel_id)
+            if existing is None or existing.channel_id == ALLJUNK_CHANNEL:
+                self.channels[ch.channel_id] = ch
+                continue
+            if existing.owner_id and existing.owner_id != ch.owner_id:
+                continue
+            existing.name = ch.name
+            existing.trust_min = ch.trust_min
+            existing.description = ch.description
+            existing.owner_id = ch.owner_id
+            existing.owner_pub = ch.owner_pub
+            existing.owner_sig = ch.owner_sig
+            existing.members.add(ch.owner_id)
+
+        async with self.db.execute(
+            "SELECT channel_id, node_id, proof FROM channel_members"
+        ) as cur:
+            rows = await cur.fetchall()
+        for channel_id, node_id, proof in rows:
+            ch = self.channels.get(channel_id)
+            if ch and ch.verify_member_id(node_id, proof):
+                ch.member_proofs[node_id] = proof
+                ch.members.add(node_id)
+
+    async def _persist_channel(self, ch: Channel):
+        if not self.db or ch.channel_id == ALLJUNK_CHANNEL or not ch.owner_id:
+            return
+        await self.db.execute(
+            "INSERT OR REPLACE INTO channels VALUES(?,?,?,?,?,?,?)",
+            (ch.channel_id, ch.name, float(ch.trust_min), ch.description,
+             ch.owner_id, ch.owner_pub, ch.owner_sig))
+        await self.db.commit()
+
+    async def _persist_member_proof(self, channel_id: str, node_id: str, proof: str):
+        if not self.db or channel_id == ALLJUNK_CHANNEL or not (node_id and proof):
+            return
+        await self.db.execute(
+            "INSERT OR REPLACE INTO channel_members VALUES(?,?,?)",
+            (channel_id, node_id, proof))
+        await self.db.commit()
+
+    def _queue_channel_persist(self, ch: Optional[Channel]):
+        if not self.db or ch is None:
+            return
+        asyncio.ensure_future(self._persist_channel(ch))
+
+    def _queue_member_persist(self, ch: Optional[Channel], node_id: str, proof: str):
+        if not self.db or ch is None:
+            return
+        asyncio.ensure_future(self._persist_member_proof(ch.channel_id, node_id, proof))
+
     def _merge_channel(self, descriptor: dict) -> Optional[Channel]:
         ch = Channel.from_descriptor(descriptor)
         if ch is None:
@@ -1382,6 +1490,7 @@ class Node:
         existing = self.channels.get(ch.channel_id)
         if existing is None:
             self.channels[ch.channel_id] = ch
+            self._queue_channel_persist(ch)
             return ch
         if existing.channel_id == ALLJUNK_CHANNEL:
             return existing
@@ -1394,6 +1503,7 @@ class Node:
         existing.owner_pub = ch.owner_pub
         existing.owner_sig = ch.owner_sig
         existing.members.add(ch.owner_id)
+        self._queue_channel_persist(existing)
         return existing
 
     async def _on_hello(self, msg: dict, addr: tuple):
@@ -1473,9 +1583,10 @@ class Node:
         if msg["from"] not in self._registered:
             return
         key = msg["payload"].get("key", "")
-        prev_addr = self.find_routes.pop(msg["channel"], key)
-        if prev_addr:
-            self._send_raw(msg, prev_addr)
+        prev_addrs = self.find_routes.pop(msg["channel"], key)
+        if prev_addrs:
+            for prev_addr in prev_addrs:
+                self._send_raw(msg, prev_addr)
             return
 
         ch = self.channels.get(msg["channel"])
@@ -1521,12 +1632,14 @@ class Node:
             ok = ch.verify_member(msg["from"], msg["pub"], proof)
             if ok:
                 ch.members.add(member_id)
+                ch.member_proofs[member_id] = proof
+                self._queue_member_persist(ch, member_id, proof)
         elif msg["from"] == ch.owner_id and msg["pub"] == ch.owner_pub:
             ok = ch.verify_member_id(member_id, proof)
             if ok:
                 ch.members.add(member_id)
-                if member_id == self.identity.node_id:
-                    ch.member_proofs[self.identity.node_id] = proof
+                ch.member_proofs[member_id] = proof
+                self._queue_member_persist(ch, member_id, proof)
 
         log.info("channel %s: %s %s", ch.name, member_id[:8],
                  "admitted" if ok else "rejected")
@@ -1584,7 +1697,14 @@ class Node:
                 return
 
             ch_id = cmd_obj.get("channel", channel_id)
-            ch = self.channels.get(ch_id)
+            ch = None
+            descriptor = cmd_obj.get("channel_desc")
+            if isinstance(descriptor, dict):
+                ch = self._merge_channel(descriptor)
+                if ch and ch.channel_id != ch_id:
+                    return
+            if ch is None:
+                ch = self.channels.get(ch_id)
             if not ch:
                 return
 
@@ -1609,6 +1729,8 @@ class Node:
                 if ts < ch.trust_min:
                     return
                 ch.members.add(sender_id)
+                ch.member_proofs[sender_id] = proof
+                self._queue_member_persist(ch, sender_id, proof)
                 from_node = sender_id
             else:
                 from_node = "onion"
@@ -1627,7 +1749,14 @@ class Node:
             if not (reply_token and reply_host and reply_port and reply_key_h):
                 log.debug("onion find: missing reply fields")
                 return
-            ch = self.channels.get(channel_id)
+            ch = None
+            descriptor = cmd_obj.get("channel_desc")
+            if isinstance(descriptor, dict):
+                ch = self._merge_channel(descriptor)
+                if ch and ch.channel_id != channel_id:
+                    return
+            if ch is None:
+                ch = self.channels.get(channel_id)
             if not ch:
                 return
 
@@ -1651,6 +1780,8 @@ class Node:
                 if ts < ch.trust_min:
                     return
                 ch.members.add(sender_id)
+                ch.member_proofs[sender_id] = proof
+                self._queue_member_persist(ch, sender_id, proof)
 
             if not await self.content.has(key, ch.channel_id):
                 log.info("onion find key=%s -- not found locally", key[:12])
@@ -1790,6 +1921,7 @@ class Node:
                 "from": self.identity.node_id,
                 "pub": self.identity.pub_hex,
                 "proof": proof,
+                "channel_desc": self.channels[channel_id].descriptor(),
                 "auth_nonce": auth_nonce,
                 "auth_sig": self.identity.sign(auth_bytes),
             })
@@ -1884,6 +2016,7 @@ class Node:
                 "from": self.identity.node_id,
                 "pub": self.identity.pub_hex,
                 "proof": proof,
+                "channel_desc": self.channels[channel_id].descriptor(),
                 "auth_nonce": auth_nonce,
                 "auth_sig": self.identity.sign(auth_bytes),
             })
@@ -1931,6 +2064,8 @@ class Node:
         if owner_proof:
             ch.member_proofs[self.identity.node_id] = owner_proof
         self.channels[cid] = ch
+        self._queue_channel_persist(ch)
+        self._queue_member_persist(ch, self.identity.node_id, owner_proof)
         log.info("channel '%s' created trust_min=%.1f", name, trust_min)
         return ch
 
@@ -1947,6 +2082,7 @@ class Node:
                 if proof:
                     channel.member_proofs[peer_id] = proof
                     channel.members.add(peer_id)
+                    self._queue_member_persist(channel, peer_id, proof)
         if not proof:
             log.error("channel_join: missing membership proof")
             return
