@@ -32,6 +32,10 @@ To wipe all node state (removes volumes):
 docker compose down -v
 ```
 
+This also deletes each node's persisted identity in `/data` (`overnet.db`,
+`node.key`, and `node.key.x25519`), so the network will come back with new
+node IDs on the next `up`.
+
 ## Optional: routing experiment override
 
 ```bash

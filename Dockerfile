@@ -39,4 +39,4 @@ EXPOSE 9000/udp
 # Entrypoint: runs node with DB in persistent volume
 # Override CMD in docker-compose to set port / peer
 ENTRYPOINT ["python", "overnet.py", "--db", "/data/overnet.db"]
-CMD ["--port", "9000"]
+CMD ["--port", "9000", "--no-cli"]

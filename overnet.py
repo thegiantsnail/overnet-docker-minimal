@@ -72,6 +72,16 @@ def _restrict_private_key_permissions(path: str):
         pass
 
 
+def _write_private_key_file(path: str, key_bytes: bytes):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(key_bytes)
+    _restrict_private_key_permissions(path)
+
+
 def _parse_avoid_peers(values: list[str]) -> tuple[list[str], set[tuple[str, int]]]:
     """Parse avoid-peer selectors.
 
@@ -131,6 +141,8 @@ CHANNEL_MEMBER_CONTEXT     = b"overnet-channel-member-v1"
 FIND_ROUTE_TTL  = 60
 MAX_FIND_ROUTES = 4096
 MAX_FIND_ROUTES_PER_KEY = 32
+GOSSIP_FAN_OUT = 5
+PEER_LIST_MAX = 10
 
 # Hot table / routing (v3)
 HOT_TABLE_SIZE    = 64
@@ -150,6 +162,7 @@ RATE_LIMIT_BURST   = 40
 TIMESTAMP_WINDOW   = 300
 NONCE_CACHE_SIZE   = 65_536
 PING_NONCE_TTL     = 60
+MESSAGE_NONCE_BYTES = 16
 
 # Content limits (v3)
 MAX_UDP_PAYLOAD     = 65_507
@@ -180,6 +193,7 @@ COVER_MIN_INTERVAL = 0.2
 
 # Relay delay mixing (v6) / exit jitter (v8/BLUE-7)
 RELAY_DELAY_MEAN   = 0.5
+REPLY_REGISTER_SETTLE = max(0.3, CIRCUIT_HOPS * RELAY_DELAY_MEAN * 2.0)
 
 
 # ---------------------------------------------------------------------
@@ -201,8 +215,8 @@ _PLAIN_SIZES = [_cell_plain_at_depth(d) for d in range(CIRCUIT_HOPS)]
 # ---------------------------------------------------------------------
 
 def make_wire_frame(cell_bytes: bytes) -> bytes:
-    assert len(cell_bytes) <= WIRE_FRAME_SIZE - 2, \
-        f"cell too large for wire frame: {len(cell_bytes)}"
+    if len(cell_bytes) > WIRE_FRAME_SIZE - 2:
+        raise ValueError(f"cell too large for wire frame: {len(cell_bytes)}")
     hdr     = struct.pack(">H", len(cell_bytes))
     padding = os.urandom(WIRE_FRAME_SIZE - 2 - len(cell_bytes))
     return hdr + cell_bytes + padding
@@ -283,11 +297,16 @@ class Identity:
             with open(keyfile, "rb") as f:
                 self._ed_priv = Ed25519PrivateKey.from_private_bytes(f.read())
         else:
-            self._ed_priv = Ed25519PrivateKey.generate()
-            with open(keyfile, "wb") as f:
-                f.write(self._ed_priv.private_bytes(
-                    Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
-            _restrict_private_key_permissions(keyfile)
+            generated = Ed25519PrivateKey.generate()
+            key_bytes = generated.private_bytes(
+                Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+            try:
+                _write_private_key_file(keyfile, key_bytes)
+                self._ed_priv = generated
+            except FileExistsError:
+                _restrict_private_key_permissions(keyfile)
+                with open(keyfile, "rb") as f:
+                    self._ed_priv = Ed25519PrivateKey.from_private_bytes(f.read())
         ed_pub = self._ed_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         self.node_id    = hashlib.sha256(ed_pub).hexdigest()
         self.pub_bytes  = ed_pub
@@ -299,14 +318,31 @@ class Identity:
             with open(xfile, "rb") as f:
                 self._x_priv = X25519PrivateKey.from_private_bytes(f.read())
         else:
-            self._x_priv = X25519PrivateKey.generate()
-            with open(xfile, "wb") as f:
-                f.write(self._x_priv.private_bytes(
-                    Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
-            _restrict_private_key_permissions(xfile)
+            generated = X25519PrivateKey.generate()
+            key_bytes = generated.private_bytes(
+                Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+            try:
+                _write_private_key_file(xfile, key_bytes)
+                self._x_priv = generated
+            except FileExistsError:
+                _restrict_private_key_permissions(xfile)
+                with open(xfile, "rb") as f:
+                    self._x_priv = X25519PrivateKey.from_private_bytes(f.read())
         x_pub = self._x_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         self.x25519_pub     = x_pub
         self.x25519_pub_hex = x_pub.hex()
+
+    @staticmethod
+    def _parse_nonce(nonce: str) -> bytes:
+        if not isinstance(nonce, str):
+            raise ValueError("nonce must be hex")
+        try:
+            nonce_bytes = bytes.fromhex(nonce)
+        except ValueError as e:
+            raise ValueError("nonce must be hex") from e
+        if len(nonce_bytes) != MESSAGE_NONCE_BYTES:
+            raise ValueError("nonce must be 16 bytes")
+        return nonce_bytes
 
     @staticmethod
     def _canonical(node_id: str, nonce: str, ts: float,
@@ -323,7 +359,7 @@ class Identity:
         decrement it without re-signing. Receivers enforce `ttl <= ttl0`.
         """
         nid = bytes.fromhex(node_id)
-        nonc = bytes.fromhex((nonce or "").ljust(32, "0")[:32])
+        nonc = Identity._parse_nonce(nonce)
 
         mt = (msg_type or "").encode()
         ch = (channel_id or "").encode()
@@ -1118,7 +1154,7 @@ class RoutingTable:
 def make_message(identity: Identity, msg_type: str, payload: dict,
                  channel_id: str = ALLJUNK_CHANNEL,
                  ttl: int = MAX_HOPS) -> bytes:
-    nonce = os.urandom(8).hex()
+    nonce = os.urandom(MESSAGE_NONCE_BYTES).hex()
     ts    = time.time()
     pb    = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
     ttl0  = int(ttl)
@@ -1283,7 +1319,7 @@ class OvernetProtocol(asyncio.DatagramProtocol):
             return
         if not self.node.rate_limiter.allow(addr[0]):
             return
-        asyncio.ensure_future(self.node.handle_raw(data, addr))
+        asyncio.create_task(self.node.handle_raw(data, addr))
 
     def send(self, data: bytes, addr: tuple):
         if self.transport:
@@ -1329,6 +1365,7 @@ class Node:
         self.protocol: Optional[OvernetProtocol] = None
         self.rate_limiter = TokenBucket()
         self.replay_cache = ReplayCache()
+        self.onion_cmd_replays = ReplayCache()
         self.reply_router = ReplyRouter()
         self.find_routes  = FindRouteCache()
         self._avoid_node_prefixes = list(avoid_node_prefixes or [])
@@ -1368,16 +1405,16 @@ class Node:
             avoid_latency_noise_ms=self._avoid_latency_noise_ms,
         )
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         _, proto = await loop.create_datagram_endpoint(
             lambda: OvernetProtocol(self),
             local_addr=(self.host, self.port))
         self.protocol = proto
 
-        asyncio.ensure_future(self._ping_loop())
-        asyncio.ensure_future(self._hot_table_loop())
-        asyncio.ensure_future(self._cleanup_loop())
-        asyncio.ensure_future(self._cover_loop())
+        asyncio.create_task(self._ping_loop())
+        asyncio.create_task(self._hot_table_loop())
+        asyncio.create_task(self._cleanup_loop())
+        asyncio.create_task(self._cover_loop())
         log.info("listening %s:%d [onion+reply+cover+mixing+SSEP-routing ENABLED]",
                  self.host, self.port)
 
@@ -1447,6 +1484,14 @@ class Node:
     def _transport_aad(self, peer_x25519_hex: str) -> bytes:
         return TRANSPORT_AAD_CONTEXT + b"|" + bytes.fromhex(peer_x25519_hex)
 
+    def _accept_onion_cmd_nonce(self, channel_id: str, cmd: str, cmd_nonce: str) -> bool:
+        try:
+            Identity._parse_nonce(cmd_nonce)
+        except ValueError:
+            return False
+        scope = f"onion:{channel_id}:{cmd}"
+        return self.onion_cmd_replays.check(scope, cmd_nonce, time.time())
+
     def _seal_transport(self, data: bytes, peer: Optional[Peer]) -> bytes:
         if peer is None or not peer.x25519_pub:
             return data
@@ -1499,7 +1544,7 @@ class Node:
         wire = self._seal_transport(data, peer)
         self.protocol.send(wire, addr)
         if peer and self.trust:
-            asyncio.ensure_future(self.trust.record_upload(peer.node_id, len(wire)))
+            asyncio.create_task(self.trust.record_upload(peer.node_id, len(wire)))
 
     def _send_raw(self, msg: dict, addr: tuple):
         data = json.dumps(msg, separators=(",", ":")).encode()
@@ -1587,12 +1632,12 @@ class Node:
     def _queue_channel_persist(self, ch: Optional[Channel]):
         if not self.db or ch is None:
             return
-        asyncio.ensure_future(self._persist_channel(ch))
+        asyncio.create_task(self._persist_channel(ch))
 
     def _queue_member_persist(self, ch: Optional[Channel], node_id: str, proof: str):
         if not self.db or ch is None:
             return
-        asyncio.ensure_future(self._persist_member_proof(ch.channel_id, node_id, proof))
+        asyncio.create_task(self._persist_member_proof(ch.channel_id, node_id, proof))
 
     def _merge_channel(self, descriptor: dict) -> Optional[Channel]:
         ch = Channel.from_descriptor(descriptor)
@@ -1629,9 +1674,9 @@ class Node:
         self._register_peer(
             msg, (addr[0], msg["payload"].get("port", addr[1])),
             x25519_pub=msg["payload"].get("x25519_pub", ""))
-        for p in msg["payload"].get("peers", [])[:5]:
+        for p in msg["payload"].get("peers", [])[:GOSSIP_FAN_OUT]:
             if p["node_id"] != self.identity.node_id:
-                asyncio.ensure_future(self.connect_peer(p["host"], p["port"]))
+                asyncio.create_task(self.connect_peer(p["host"], p["port"]))
 
     async def _on_ping(self, msg: dict, addr: tuple):
         if msg["from"] not in self._registered:
@@ -1647,7 +1692,7 @@ class Node:
     async def _on_peers(self, msg: dict, addr: tuple):
         for p in msg["payload"].get("peers", []):
             if p["node_id"] != self.identity.node_id:
-                asyncio.ensure_future(self.connect_peer(p["host"], p["port"]))
+                asyncio.create_task(self.connect_peer(p["host"], p["port"]))
 
     async def _on_store(self, msg: dict, addr: tuple):
         if msg["from"] not in self._registered:
@@ -1719,8 +1764,17 @@ class Node:
             log.info("found key=%s OK", key[:12])
 
     async def _on_route(self, msg: dict, addr: tuple):
-        if msg["ttl"] > 0:
-            await self._forward(msg)
+        if msg["from"] not in self._registered or msg["ttl"] <= 0:
+            return
+        ch = self.channels.get(msg["channel"])
+        if ch is None:
+            if msg["channel"] != ALLJUNK_CHANNEL:
+                return
+        else:
+            ts = await self.trust.score(msg["from"])
+            if not ch.admits(msg["from"], ts):
+                return
+        await self._forward(msg)
 
     async def _on_channel_join(self, msg: dict, addr: tuple):
         payload = msg.get("payload", {})
@@ -1780,7 +1834,7 @@ class Node:
                 self._send("onion", {"cell": inner_hex}, (host, port), ch)
                 log.debug("onion relay (delay=%.2fs) -> %s:%d", delay, host, port)
 
-            asyncio.ensure_future(_delayed_forward(
+            asyncio.create_task(_delayed_forward(
                 result["inner_frame"].hex(),
                 result["next_host"],
                 result["next_port"],
@@ -1819,20 +1873,22 @@ class Node:
                 return
 
             # Enforce channel policy for onion store.
+            cmd_nonce = cmd_obj.get("cmd_nonce", "")
+            if not self._accept_onion_cmd_nonce(ch_id, cmd, cmd_nonce):
+                return
             if ch.channel_id != ALLJUNK_CHANNEL:
                 sender_id = cmd_obj.get("from", "")
                 sender_pub = cmd_obj.get("pub", "")
                 proof = cmd_obj.get("proof", "")
-                auth_nonce = cmd_obj.get("auth_nonce", "")
                 auth_sig = cmd_obj.get("auth_sig", "")
                 if not (sender_id and sender_pub and proof):
                     return
                 if not ch.verify_member(sender_id, sender_pub, proof):
                     return
-                if not (auth_nonce and auth_sig):
+                if not auth_sig:
                     return
                 data_key = hashlib.sha256(data).hexdigest()
-                auth_bytes = f"{ch.channel_id}|store|{data_key}|{auth_nonce}".encode()
+                auth_bytes = f"{ch.channel_id}|store|{data_key}|{cmd_nonce}".encode()
                 if not self.identity.verify(sender_pub, auth_bytes, auth_sig):
                     return
                 ts = await self.trust.score(sender_id)
@@ -1853,11 +1909,16 @@ class Node:
             key         = cmd_obj.get("key", "")
             reply_token = cmd_obj.get("reply_token", "")
             reply_host  = cmd_obj.get("reply_host", "")
-            reply_port  = int(cmd_obj.get("reply_port", 0))
+            try:
+                reply_port = int(cmd_obj.get("reply_port", 0))
+            except (TypeError, ValueError):
+                return
             reply_key_h = cmd_obj.get("reply_key", "")
 
-            if not (reply_token and reply_host and reply_port and reply_key_h):
+            if not (reply_token and reply_host and reply_key_h):
                 log.debug("onion find: missing reply fields")
+                return
+            if not (1 <= reply_port <= 65535):
                 return
             ch = None
             descriptor = cmd_obj.get("channel_desc")
@@ -1869,21 +1930,23 @@ class Node:
                 ch = self.channels.get(channel_id)
             if not ch:
                 return
+            cmd_nonce = cmd_obj.get("cmd_nonce", "")
+            if not self._accept_onion_cmd_nonce(channel_id, cmd, cmd_nonce):
+                return
 
             # Enforce channel policy for onion find (non-public channels require proof).
             if ch.channel_id != ALLJUNK_CHANNEL:
                 sender_id = cmd_obj.get("from", "")
                 sender_pub = cmd_obj.get("pub", "")
                 proof = cmd_obj.get("proof", "")
-                auth_nonce = cmd_obj.get("auth_nonce", "")
                 auth_sig = cmd_obj.get("auth_sig", "")
                 if not (sender_id and sender_pub and proof):
                     return
                 if not ch.verify_member(sender_id, sender_pub, proof):
                     return
-                if not (auth_nonce and auth_sig):
+                if not auth_sig:
                     return
-                auth_bytes = f"{ch.channel_id}|find|{key}|{auth_nonce}".encode()
+                auth_bytes = f"{ch.channel_id}|find|{key}|{cmd_nonce}".encode()
                 if not self.identity.verify(sender_pub, auth_bytes, auth_sig):
                     return
                 ts = await self.trust.score(sender_id)
@@ -1930,14 +1993,17 @@ class Node:
                 log.info("onion find key=%s -- reply -> %s:%d (delay=%.2fs)",
                          _key_log, _reply_addr[0], _reply_addr[1], delay)
 
-            asyncio.ensure_future(_jittered_reply())
+            asyncio.create_task(_jittered_reply())
 
         elif cmd == "reply_register":
             token      = cmd_obj.get("token", "")
             next_host  = cmd_obj.get("next_host", "")
-            next_port  = int(cmd_obj.get("next_port", 0))
+            try:
+                next_port = int(cmd_obj.get("next_port", 0))
+            except (TypeError, ValueError):
+                return
             next_token = cmd_obj.get("next_token", "")
-            if token and next_host and next_port and next_token:
+            if token and next_host and next_token and 1 <= next_port <= 65535:
                 self.reply_router.register(token, next_host, next_port, next_token)
 
         elif cmd == "drop":
@@ -2012,19 +2078,20 @@ class Node:
             log.error("onion publish aborted: only %d onion peers", len(hops))
             return None
 
+        cmd_nonce = os.urandom(MESSAGE_NONCE_BYTES).hex()
         payload_obj = {
             "cmd": "store",
             "data": data.hex(),
             "channel": channel_id,
+            "cmd_nonce": cmd_nonce,
         }
         # For non-public channels, include membership proof so exits can enforce policy.
         if channel_id != ALLJUNK_CHANNEL:
             if channel_id not in self.channels:
                 log.error("onion publish: unknown channel")
                 return None
-            auth_nonce = os.urandom(8).hex()
             data_key = hashlib.sha256(data).hexdigest()
-            auth_bytes = f"{channel_id}|store|{data_key}|{auth_nonce}".encode()
+            auth_bytes = f"{channel_id}|store|{data_key}|{cmd_nonce}".encode()
             proof = self.channels.get(channel_id, Channel.all_junk()).membership_proof(self.identity)
             if not proof:
                 log.error("onion publish: missing local membership proof")
@@ -2034,7 +2101,6 @@ class Node:
                 "pub": self.identity.pub_hex,
                 "proof": proof,
                 "channel_desc": self.channels[channel_id].descriptor(),
-                "auth_nonce": auth_nonce,
                 "auth_sig": self.identity.sign(auth_bytes),
             })
         payload = json.dumps(payload_obj, separators=(",", ":")).encode()
@@ -2099,13 +2165,14 @@ class Node:
             frame = OnionRouter.build_circuit([hop], reg_payload)
             self._send("onion", {"cell": frame.hex()}, hop.addr, channel_id)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut  = loop.create_future()
         self._pending_replies[token_origin]    = fut
         self._pending_reply_keys[token_origin] = reply_key
 
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(REPLY_REGISTER_SETTLE)
 
+        cmd_nonce = os.urandom(MESSAGE_NONCE_BYTES).hex()
         find_obj = {
             "cmd":         "find",
             "key":         key,
@@ -2113,13 +2180,13 @@ class Node:
             "reply_host":  reply_hops[0].host,
             "reply_port":  reply_hops[0].port,
             "reply_key":   reply_key.hex(),
+            "cmd_nonce":   cmd_nonce,
         }
         if channel_id != ALLJUNK_CHANNEL:
             if channel_id not in self.channels:
                 log.error("find_onion: unknown channel")
                 return None
-            auth_nonce = os.urandom(8).hex()
-            auth_bytes = f"{channel_id}|find|{key}|{auth_nonce}".encode()
+            auth_bytes = f"{channel_id}|find|{key}|{cmd_nonce}".encode()
             proof = self.channels.get(channel_id, Channel.all_junk()).membership_proof(self.identity)
             if not proof:
                 log.error("find_onion: missing local membership proof")
@@ -2129,7 +2196,6 @@ class Node:
                 "pub": self.identity.pub_hex,
                 "proof": proof,
                 "channel_desc": self.channels[channel_id].descriptor(),
-                "auth_nonce": auth_nonce,
                 "auth_sig": self.identity.sign(auth_bytes),
             })
         find_payload = json.dumps(find_obj, separators=(",", ":")).encode()
@@ -2264,7 +2330,7 @@ class Node:
             node_id=nid, host=addr[0], port=addr[1],
             pub_hex=msg["pub"], x25519_pub=x25519_pub))
         self._registered.add(nid)
-        asyncio.ensure_future(self._log_peer(nid, addr, x25519_pub))
+        asyncio.create_task(self._log_peer(nid, addr, x25519_pub))
 
     async def _log_peer(self, nid: str, addr: tuple, x25519_pub: str):
         ts = await self.trust.score(nid)
@@ -2274,7 +2340,7 @@ class Node:
 
     def _peer_list(self) -> list:
         return [{"node_id": p.node_id, "host": p.host, "port": p.port}
-                for p in list(self.routing.peers.values())[:10]]
+                for p in list(self.routing.peers.values())[:PEER_LIST_MAX]]
 
     async def status(self):
         total_mb = (await self.content.total_stored()) / (1024 * 1024)
@@ -2414,7 +2480,7 @@ async def main():
     print("Commands: status | publish <text> | onion <text> | "
           "find <key> | fetch <key> | quit")
     print("  find  = plaintext find  |  fetch = anonymous find + reply circuit")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     while True:
         try:
             cmd = await loop.run_in_executor(None, input, "> ")
