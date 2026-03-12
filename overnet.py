@@ -114,7 +114,7 @@ def _parse_avoid_peers(values: list[str]) -> tuple[list[str], set[tuple[str, int
 # CONSTANTS
 # ---------------------------------------------------------------------
 
-ALLJUNK_CHANNEL   = "a" * 64
+ALLJUNK_CHANNEL   = "a" * 64  # Reserved no-op/public baseline channel identifier
 PROTOCOL_VERSION  = 10
 MARKOV_LAMBDA     = 0.01
 TRUST_FLOOR       = 0.1
