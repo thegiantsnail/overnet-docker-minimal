@@ -65,6 +65,13 @@ def _canonical_json_bytes(obj: dict) -> bytes:
     return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode()
 
 
+def _restrict_private_key_permissions(path: str):
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _parse_avoid_peers(values: list[str]) -> tuple[list[str], set[tuple[str, int]]]:
     """Parse avoid-peer selectors.
 
@@ -140,7 +147,7 @@ TRUST_VELOCITY_DAMP   = 0.2
 RATE_LIMIT_BUCKET  = 20
 RATE_LIMIT_BURST   = 40
 TIMESTAMP_WINDOW   = 300
-NONCE_CACHE_SIZE   = 4096
+NONCE_CACHE_SIZE   = 65_536
 PING_NONCE_TTL     = 60
 
 # Content limits (v3)
@@ -156,6 +163,10 @@ ROUTING_RESERVE   = 85
 CELL_OVERHEAD     = 60
 PLAIN_HEADER      = 5
 ONION_INFO        = b"overnet-onion-v6"
+ONION_AAD_CONTEXT = b"overnet-onion-aad-v1"
+TRANSPORT_INFO    = b"overnet-transport-v1"
+TRANSPORT_AAD_CONTEXT = b"overnet-transport-aad-v1"
+REPLY_AAD_CONTEXT = b"overnet-reply-aad-v1"
 WIRE_FRAME_SIZE   = 900
 
 # Reply circuits (v5)
@@ -236,18 +247,27 @@ class TokenBucket:
 
 class ReplayCache:
     def __init__(self, maxsize: int = NONCE_CACHE_SIZE):
-        self._seen: collections.OrderedDict[str, float] = collections.OrderedDict()
+        self._seen: collections.OrderedDict[tuple[str, str], float] = collections.OrderedDict()
         self._maxsize = maxsize
 
-    def check(self, nonce: str, timestamp: float) -> bool:
-        if abs(time.time() - timestamp) > TIMESTAMP_WINDOW:
+    def _evict_expired(self, now: float):
+        cutoff = now - TIMESTAMP_WINDOW
+        expired = [key for key, ts in self._seen.items() if ts < cutoff]
+        for key in expired:
+            self._seen.pop(key, None)
+
+    def check(self, node_id: str, nonce: str, timestamp: float) -> bool:
+        now = time.time()
+        if abs(now - timestamp) > TIMESTAMP_WINDOW:
             return False
-        if nonce in self._seen:
+        self._evict_expired(now)
+        cache_key = (node_id, nonce)
+        if cache_key in self._seen:
             return False
-        self._seen[nonce] = timestamp
-        self._seen.move_to_end(nonce)
-        if len(self._seen) > self._maxsize:
-            self._seen.popitem(last=False)
+        if len(self._seen) >= self._maxsize:
+            return False
+        self._seen[cache_key] = timestamp
+        self._seen.move_to_end(cache_key)
         return True
 
 
@@ -258,6 +278,7 @@ class ReplayCache:
 class Identity:
     def __init__(self, keyfile: str = "node.key"):
         if os.path.exists(keyfile):
+            _restrict_private_key_permissions(keyfile)
             with open(keyfile, "rb") as f:
                 self._ed_priv = Ed25519PrivateKey.from_private_bytes(f.read())
         else:
@@ -265,6 +286,7 @@ class Identity:
             with open(keyfile, "wb") as f:
                 f.write(self._ed_priv.private_bytes(
                     Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
+            _restrict_private_key_permissions(keyfile)
         ed_pub = self._ed_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         self.node_id    = hashlib.sha256(ed_pub).hexdigest()
         self.pub_bytes  = ed_pub
@@ -272,6 +294,7 @@ class Identity:
 
         xfile = keyfile + ".x25519"
         if os.path.exists(xfile):
+            _restrict_private_key_permissions(xfile)
             with open(xfile, "rb") as f:
                 self._x_priv = X25519PrivateKey.from_private_bytes(f.read())
         else:
@@ -279,6 +302,7 @@ class Identity:
             with open(xfile, "wb") as f:
                 f.write(self._x_priv.private_bytes(
                     Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
+            _restrict_private_key_permissions(xfile)
         x_pub = self._x_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         self.x25519_pub     = x_pub
         self.x25519_pub_hex = x_pub.hex()
@@ -383,9 +407,13 @@ class OnionRouter:
     """
 
     @staticmethod
-    def _derive_key(shared: bytes) -> bytes:
+    def _derive_key(shared: bytes, salt: bytes) -> bytes:
         return HKDF(algorithm=hashes.SHA256(), length=32,
-                    salt=None, info=ONION_INFO).derive(shared)
+                    salt=salt, info=ONION_INFO).derive(shared)
+
+    @staticmethod
+    def _aad(plain_size: int) -> bytes:
+        return ONION_AAD_CONTEXT + struct.pack(">H", plain_size)
 
     @staticmethod
     def _seal(x25519_pub_bytes: bytes, body: bytes,
@@ -395,13 +423,13 @@ class OnionRouter:
             Encoding.Raw, PublicFormat.Raw)
         shared = ephem_priv.exchange(
             X25519PublicKey.from_public_bytes(x25519_pub_bytes))
-        key   = OnionRouter._derive_key(shared)
         raw   = struct.pack(">IB", len(body), flags) + body
         if len(raw) > plain_size:
             raise ValueError(f"onion body too large: {len(raw)} > {plain_size}")
         plain = raw + os.urandom(plain_size - len(raw))
         nonce = os.urandom(12)
-        ct    = ChaCha20Poly1305(key).encrypt(nonce, plain, None)
+        key   = OnionRouter._derive_key(shared, nonce)
+        ct    = ChaCha20Poly1305(key).encrypt(nonce, plain, OnionRouter._aad(plain_size))
         return ephem_pub + nonce + ct
 
     @staticmethod
@@ -411,10 +439,14 @@ class OnionRouter:
         ephem_pub = cell_bytes[:32]
         nonce     = cell_bytes[32:44]
         ct        = cell_bytes[44:]
+        plain_size = len(ct) - 16
+        if plain_size < PLAIN_HEADER:
+            return None
         try:
             shared = identity.x25519_exchange(ephem_pub)
-            key    = OnionRouter._derive_key(shared)
-            plain  = ChaCha20Poly1305(key).decrypt(nonce, ct, None)
+            key    = OnionRouter._derive_key(shared, nonce)
+            plain  = ChaCha20Poly1305(key).decrypt(
+                nonce, ct, OnionRouter._aad(plain_size))
         except InvalidTag:
             return None
         except ValueError as e:
@@ -1101,26 +1133,25 @@ def parse_message(data: bytes, replay_cache: ReplayCache) -> Optional[dict]:
                 "nonce", "ttl", "ttl0", "payload", "sig")):
         return None
 
-    # Explicit version gating: signature canonicalization is versioned.
     if msg.get("v") != PROTOCOL_VERSION:
         return None
 
-    # ttl must be in [0, ttl0] to prevent hop amplification.
     try:
         ttl = int(msg.get("ttl", 0))
         ttl0 = int(msg.get("ttl0", 0))
+        ts = float(msg.get("ts", 0.0))
     except (TypeError, ValueError):
         return None
     if ttl < 0 or ttl0 < 0 or ttl > ttl0:
         return None
-    if not replay_cache.check(msg["nonce"], float(msg["ts"])):
-        return None
     pb = json.dumps(msg["payload"], separators=(",", ":"), sort_keys=True).encode()
     if not Identity.verify_msg(
-        msg["pub"], msg["from"], msg["nonce"], float(msg["ts"]),
+        msg["pub"], msg["from"], msg["nonce"], ts,
         msg.get("type", ""), msg.get("channel", ""), ttl0,
         pb, msg["sig"],
     ):
+        return None
+    if not replay_cache.check(msg["from"], msg["nonce"], ts):
         return None
     return msg
 
@@ -1343,7 +1374,10 @@ class Node:
                  self.host, self.port)
 
     async def handle_raw(self, data: bytes, addr: tuple):
-        msg = parse_message(data, self.replay_cache)
+        inner = self._unwrap_transport(data)
+        if inner is None:
+            return
+        msg = parse_message(inner, self.replay_cache)
         if msg is None:
             return
 
@@ -1379,20 +1413,78 @@ class Node:
         if h:
             await h(msg, addr)
 
-    def _lookup_peer_id(self, addr: tuple) -> Optional[str]:
+    def _lookup_peer(self, addr: tuple) -> Optional[Peer]:
         if not self.routing:
             return None
-        for nid, peer in self.routing.peers.items():
+        for peer in self.routing.peers.values():
             if peer.host == addr[0] and peer.port == addr[1]:
-                return nid
+                return peer
         return None
+
+    def _lookup_peer_id(self, addr: tuple) -> Optional[str]:
+        peer = self._lookup_peer(addr)
+        return peer.node_id if peer else None
+
+    def _transport_aad(self, peer_x25519_hex: str) -> bytes:
+        return TRANSPORT_AAD_CONTEXT + b"|" + bytes.fromhex(peer_x25519_hex)
+
+    def _seal_transport(self, data: bytes, peer: Optional[Peer]) -> bytes:
+        if peer is None or not peer.x25519_pub:
+            return data
+        nonce = os.urandom(12)
+        ephem_priv = X25519PrivateKey.generate()
+        ephem_pub = ephem_priv.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw)
+        shared = ephem_priv.exchange(
+            X25519PublicKey.from_public_bytes(bytes.fromhex(peer.x25519_pub)))
+        key = HKDF(algorithm=hashes.SHA256(), length=32,
+                   salt=nonce, info=TRANSPORT_INFO).derive(shared)
+        aad = self._transport_aad(peer.x25519_pub)
+        ct = ChaCha20Poly1305(key).encrypt(nonce, data, aad)
+        return json.dumps({
+            "tv": 1,
+            "epk": ephem_pub.hex(),
+            "nonce": nonce.hex(),
+            "ct": ct.hex(),
+        }, separators=(",", ":")).encode()
+
+    def _unwrap_transport(self, data: bytes) -> Optional[bytes]:
+        try:
+            wrapper = json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return data
+        if not isinstance(wrapper, dict) or wrapper.get("tv") != 1:
+            return data
+        if not all(k in wrapper for k in ("tv", "epk", "nonce", "ct")):
+            return None
+        try:
+            epk = bytes.fromhex(wrapper["epk"])
+            nonce = bytes.fromhex(wrapper["nonce"])
+            ct = bytes.fromhex(wrapper["ct"])
+        except (TypeError, ValueError):
+            return None
+        try:
+            shared = self.identity.x25519_exchange(epk)
+            key = HKDF(algorithm=hashes.SHA256(), length=32,
+                       salt=nonce, info=TRANSPORT_INFO).derive(shared)
+            aad = self._transport_aad(self.identity.x25519_pub_hex)
+            plain = ChaCha20Poly1305(key).decrypt(nonce, ct, aad)
+        except (InvalidTag, ValueError):
+            return None
+        if not DiskGuard.raw_packet_ok(plain):
+            return None
+        return plain
+
+    def _send_bytes(self, data: bytes, addr: tuple):
+        peer = self._lookup_peer(addr)
+        wire = self._seal_transport(data, peer)
+        self.protocol.send(wire, addr)
+        if peer and self.trust:
+            asyncio.ensure_future(self.trust.record_upload(peer.node_id, len(wire)))
 
     def _send_raw(self, msg: dict, addr: tuple):
         data = json.dumps(msg, separators=(",", ":")).encode()
-        self.protocol.send(data, addr)
-        peer_id = self._lookup_peer_id(addr)
-        if peer_id and self.trust:
-            asyncio.ensure_future(self.trust.record_upload(peer_id, len(data)))
+        self._send_bytes(data, addr)
 
     async def _init_channel_tables(self):
         await self.db.execute("""
@@ -1583,6 +1675,15 @@ class Node:
         if msg["from"] not in self._registered:
             return
         key = msg["payload"].get("key", "")
+        try:
+            data = bytes.fromhex(msg["payload"].get("data", ""))
+        except ValueError:
+            return
+        if not DiskGuard.item_size_ok(data):
+            return
+        if hashlib.sha256(data).hexdigest() != key:
+            log.warning("found key=%s HASH MISMATCH", key[:12])
+            return
         prev_addrs = self.find_routes.pop(msg["channel"], key)
         if prev_addrs:
             for prev_addr in prev_addrs:
@@ -1594,16 +1695,6 @@ class Node:
             return
         ts = await self.trust.score(msg["from"])
         if not ch.admits(msg["from"], ts):
-            return
-
-        try:
-            data = bytes.fromhex(msg["payload"].get("data", ""))
-        except ValueError:
-            return
-        if not DiskGuard.item_size_ok(data):
-            return
-        if hashlib.sha256(data).hexdigest() != key:
-            log.warning("found key=%s HASH MISMATCH", key[:12])
             return
         if await self.content.put(data, msg["channel"], msg["from"]):
             log.info("found key=%s OK", key[:12])
@@ -1798,7 +1889,8 @@ class Node:
             try:
                 reply_key  = bytes.fromhex(reply_key_h)
                 nonce      = os.urandom(12)
-                ciphertext = ChaCha20Poly1305(reply_key).encrypt(nonce, data, None)
+                aad = REPLY_AAD_CONTEXT + b"|" + reply_token.encode()
+                ciphertext = ChaCha20Poly1305(reply_key).encrypt(nonce, data, aad)
             except (InvalidTag, ValueError) as e:
                 log.error("onion find reply encrypt: %s", e)
                 return
@@ -1842,8 +1934,9 @@ class Node:
             key = self._pending_reply_keys.pop(token, None)
             if key and not fut.done():
                 try:
+                    aad = REPLY_AAD_CONTEXT + b"|" + token.encode()
                     content = ChaCha20Poly1305(key).decrypt(
-                        bytes.fromhex(nonce_h), bytes.fromhex(ct_h), None)
+                        bytes.fromhex(nonce_h), bytes.fromhex(ct_h), aad)
                     fut.set_result(content)
                     log.info("onion reply delivered OK token=%s size=%d",
                              token[:8], len(content))
@@ -2140,10 +2233,7 @@ class Node:
     def _send(self, msg_type: str, payload: dict, addr: tuple,
               channel_id: str = ALLJUNK_CHANNEL):
         data = make_message(self.identity, msg_type, payload, channel_id)
-        self.protocol.send(data, addr)
-        peer_id = self._lookup_peer_id(addr)
-        if peer_id and self.trust:
-            asyncio.ensure_future(self.trust.record_upload(peer_id, len(data)))
+        self._send_bytes(data, addr)
 
     def _register_peer(self, msg: dict, addr: tuple, x25519_pub: str = ""):
         nid = msg["from"]
