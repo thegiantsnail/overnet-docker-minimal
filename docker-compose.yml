@@ -15,6 +15,12 @@
 # node-g             172.30.0.16  :9006
 # ─────────────────────────────────────────────────────────────────
 
+# ⚠️ Security note:
+# - This compose file is for LOCAL TESTING ONLY.
+# - All nodes bootstrap from node-a for convenience (single bootstrap point).
+# - UDP ports 9000-9006 are published on the host; bind to localhost or firewall
+#   these ports if running on a shared or internet-connected machine.
+#
 networks:
   overnet:
     driver: bridge
