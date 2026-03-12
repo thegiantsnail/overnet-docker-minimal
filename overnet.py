@@ -1382,6 +1382,10 @@ class Node:
                  self.host, self.port)
 
     async def handle_raw(self, data: bytes, addr: tuple):
+        peer = self._lookup_peer(addr)
+        if peer and peer.x25519_pub and not self._is_transport_wrapper(data):
+            log.debug("transport downgrade rejected from %s:%d", addr[0], addr[1])
+            return
         inner = self._unwrap_transport(data)
         if inner is None:
             return
@@ -1432,6 +1436,13 @@ class Node:
     def _lookup_peer_id(self, addr: tuple) -> Optional[str]:
         peer = self._lookup_peer(addr)
         return peer.node_id if peer else None
+
+    def _is_transport_wrapper(self, data: bytes) -> bool:
+        try:
+            wrapper = json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        return isinstance(wrapper, dict) and wrapper.get("tv") == 1
 
     def _transport_aad(self, peer_x25519_hex: str) -> bytes:
         return TRANSPORT_AAD_CONTEXT + b"|" + bytes.fromhex(peer_x25519_hex)
