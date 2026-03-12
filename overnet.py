@@ -1,4 +1,4 @@
-﻿"""overnet.py - Hardened Overnet Implementation v9
+"""overnet.py - Hardened Overnet Implementation v9
 
 Notes
 -----
@@ -130,6 +130,7 @@ CHANNEL_MEMBER_CONTEXT     = b"overnet-channel-member-v1"
 # Plain find reverse-route cache (v10)
 FIND_ROUTE_TTL  = 60
 MAX_FIND_ROUTES = 4096
+MAX_FIND_ROUTES_PER_KEY = 32
 
 # Hot table / routing (v3)
 HOT_TABLE_SIZE    = 64
@@ -613,6 +614,7 @@ class FindRoute:
 
 class FindRouteCache:
     MAX_ROUTES = MAX_FIND_ROUTES
+    MAX_ROUTES_PER_KEY = MAX_FIND_ROUTES_PER_KEY
 
     def __init__(self):
         self._routes: collections.OrderedDict[str, list[FindRoute]] = \
@@ -626,11 +628,17 @@ class FindRouteCache:
         if not (channel_id and key):
             return
         route_key = self._route_key(channel_id, key)
-        routes = [
+        active_routes = [
             route for route in self._routes.get(route_key, [])
-            if not route.expired and route.prev_addr != prev_addr
+            if not route.expired
         ]
-        routes.append(FindRoute(prev_addr))
+        duplicate = any(route.prev_addr == prev_addr for route in active_routes)
+        routes = [
+            route for route in active_routes
+            if route.prev_addr != prev_addr
+        ]
+        if duplicate or len(routes) < self.MAX_ROUTES_PER_KEY:
+            routes.append(FindRoute(prev_addr))
         self._routes[route_key] = routes
         self._routes.move_to_end(route_key)
         while len(self._routes) > self.MAX_ROUTES:
@@ -2433,3 +2441,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
