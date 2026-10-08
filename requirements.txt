@@ -1,2 +1,2 @@
 aiosqlite==0.22.1
-cryptography==49.0.0
+cryptography==50.0.2
